@@ -1,0 +1,817 @@
+---
+date: "Arthur Pecherskih (*last updated on* `r format(Sys.time(), '%d.%m.%y')`)"
+title: "**Картография российской социологической периодики: код для воспроизведения результатов**"
+output:
+  html_document:
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+
+<style type="text/css">
+
+h1.title {
+  height: 10px;
+  font-size: 18px;
+}
+
+h4.author {
+  font-size: 18px;
+}
+
+</style>
+
+
+
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      cache = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+
+
+
+```{r}
+# общие библиотеки
+library(tidyverse)
+library(stringr)
+
+# чтение файлов
+library(xlsx)
+library(readr)
+
+# таблица
+library(kableExtra)
+
+# работа с текстовыми данными
+library(tidytext)
+library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textmodels)
+
+# визуализация
+library(plotly)
+library(ggtext)
+```
+
+
+## **1. Загрузка данных**
+
+
+Всего у нас есть данные о 13,696 статей, вышедших в 14 журналах с 2010 по 2023 годы.
+
+```{r}
+data <- read.csv("journals_2010_2023.csv") #19,956 ---> 13,696 
+```
+
+
+
+Распределение имеющихся данных по журналам:
+
+```{r}
+## короткие имена для журналов
+short_journal_names <- data %>% 
+  count(journal_name) %>% 
+  mutate(short_journal_name = c("Laboratorium",
+                                "Вестник РУДН",
+                                "Вестник СПбГУ",
+                                "Вестник ИС",
+                                "ЖИСП",
+                                "ЖССА",
+                                "Мир России",
+                                "Мониторинг...",
+                                "СНиСП",
+                                "СоцИс",
+                                "Социологический журнал",
+                                "Социология власти",
+                                "4М",
+                                "Экономическая социология"))
+
+
+
+data %>% 
+  mutate(collected = ifelse(article_abstract == "-",
+                            "-",
+                            "+")) %>% 
+  left_join(short_journal_names) %>% 
+  
+   
+  ggplot(aes(reorder(short_journal_name, n), fill = collected)) +
+  geom_bar() +
+  theme_minimal() +
+  coord_flip() +
+  scale_fill_manual(values = c("grey60", "black")) +
+  labs(title = "Распределение статей по журналам",
+       fill = "Наличие аннотации",
+       y = "число статей",
+       x = "",
+       subtitle = "2010-2023 | отсутствие аннотации - серый цвет") +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+
+```
+
+***
+
+... и по годам:
+
+
+```{r}
+data %>% 
+  mutate(collected = ifelse(article_abstract == "-",
+                            "-",
+                            "+")) %>% 
+  ggplot(aes(year, fill = collected)) +
+  geom_bar() +
+  theme_minimal() +
+  scale_fill_manual(values = c("grey60", "black")) +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  labs(title = "Распределение статей по годам",
+       fill = "Наличие аннотации",
+       y = "число статей",
+       x = "",
+       subtitle = "2010-2023 | отсутствие аннотации - серый цвет") +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+***
+
+
+В обоих случаях "отсутствующая аннотация" отсылает не только к аннотациям, которые по какой-то причине не были добыты (из журнальных сайтов или "КиберЛенинки"), но и к тем случаям, когда статьи являлись отчетами о прошедших круглых статьях, рецензиями, поздравлениями коллег и проч.
+
+
+## **2. Подготовка корпуса**
+
+
+Шаги по предобработке:
+
+
+  1. удаление рецензий, переводов, круглых столов, etc. (здесь - тех, что не были отсеяны на этапе сбора данных);
+  
+  2. удаление лишней информации (ключевые слова, DOI, etc.);
+  
+  3. удаление слишком длинных и слишком коротких аннотаций;
+  
+  4. нормализация написаний (“e” и “ё”);
+  
+  5. лемматизация (с помощью *Yandex-mystem*)
+  
+  6. поиск коллокаций (функция `textstat_collocations()` пакета "quanteda.textstats");
+  
+  7. удаление стоп-слов и очень редких слов (менее 50 аннотаций);
+  
+  8. приведение к формату “мешка слов” (bag of words).
+
+
+
+Отсеивание ненужных символов и текстов:
+
+```{r}
+###################################
+### удаление лишней информации: ###
+###################################
+
+abstracts <- data %>% 
+  filter(!is.na(article_abstract)) %>%  
+  filter(article_abstract != "") %>% 
+  filter(article_abstract != " ") %>% 
+  filter(!str_detect(article_abstract, "ецензия|ЕЦЕНЗИЯ")) %>% 
+  filter(article_abstract != "-") %>%  
+  filter(article_abstract != "нет") %>%  
+  filter(article_abstract != "Читать в формате PDF>>") %>% 
+  filter(article_abstract != "***") %>%  
+  filter(article_abstract != "  ") %>% 
+  filter(!str_detect(article_name, "ецензия|ЕЦЕНЗИЯ")) %>% 
+  filter(str_detect(article_abstract, "а|б|в|г|д|е|ё|ж|з|и|к|л|м|н|о|п|р|с|т|у|ф|х|ц|ч|ш|щ|ъ|ы|ь|э|ю|я|А|Б|В|Г|Д|Е|Ё|Ж|З|И|К|Л|М|Н|О|П|Р|С|Т|У|Ф|Х|Ц|Ч|Ш|Щ|Ъ|Ы|Ь|Э|Ю|Я"))
+
+## 13,696 --> 10,235
+
+####################################################################
+### удаление повторяющихся и слишком длинных/коротких аннотаций, ###
+### унификация написаний, удаление ненужных жанров:              ###
+####################################################################
+
+abstracts <- abstracts %>% 
+  anti_join(abstracts %>%
+              count(article_abstract) %>%
+              arrange(desc(n)) %>% 
+              filter(n > 1)) %>%
+
+  mutate(article_abstract = str_remove_all(article_abstract,
+                                           "\\n|\\t"),
+         n_char = nchar(article_abstract)) %>% 
+  filter(n_char < 3994 & n_char > 100) %>% 
+  select(-n_char) %>% 
+
+      
+  mutate(article_abstract = str_replace_all(article_abstract, "ё", "е")) %>% 
+  
+  filter(!str_detect(article_abstract, "^Интервью с|^Беседа|^Книга"))
+### 10,235 --> 10,118
+
+####################################################
+### отсоединение оставшихся DOI и ключевых слов: ###
+####################################################
+
+abstracts <- abstracts %>% 
+   
+  separate(article_abstract,
+           c("article_abstract", "DOI2"),
+           sep = "DOI") %>% 
+  
+  separate(article_abstract,
+           c("article_abstract", "keywords2"),
+           sep = "Ключевые слова") %>% 
+  select(-DOI2, -keywords2)
+
+
+
+```
+
+
+
+Лемматизация:
+
+
+```{r, include=F}
+t <- Sys.time()
+abstracts <- abstracts %>% 
+  mutate(abstract_lem = system2("mystem",
+                                c("-d",
+                                  "-l",
+                                  "-e utf-8",
+                                  "-c"),
+                                input = article_abstract,
+                                stdout = TRUE))
+Sys.time() - t
+```
+
+
+```{r}
+#t <- Sys.time()
+#abstracts <- abstracts %>% 
+#  mutate(abstract_lem = system2("mystem",
+#                                c("-d",
+#                                  "-l",
+#                                  "-e utf-8",
+#                                  "-c"),
+#                                input = article_abstract,
+#                                stdout = TRUE))
+#Sys.time() - t
+
+rm(list = ls())
+load("image_after_lemmatization.RData")
+```
+
+
+
+Повторная фильтрация по жанрам (на лемматизированных текстах):
+
+```{r}
+abstracts2 <- abstracts %>% ## 10,118
+  filter(!str_detect(abstract_lem, "конференция")) %>%  ## 10,041
+  filter(!str_detect(abstract_lem, "рецензия")) %>%     ##  9,996
+  filter(!str_detect(abstract_lem, "круглый")) %>%      ##  9,983
+  filter(!str_detect(abstract_lem, "перевод")) %>%      ##  9,856
+  filter(!str_detect(abstract_lem, "семинар")) %>%      ##  9,833
+  filter(!str_detect(abstract_lem, "сессия")) %>%       ##  9,828
+  filter(!str_detect(abstract_lem, "книга")) %>%        ##  9,540
+  filter(!str_detect(abstract_lem, "глава"))            ##  9,485
+```
+
+
+
+Поиск коллокаций:
+
+
+```{r}
+#abstracts2 <- abstracts2 %>% 
+#  mutate(text_for_coll = str_squish(str_remove_all(abstract_lem,
+#                                        "[[:punct:]]|\\{|\\}")))
+
+
+#t <- Sys.time()
+#abstracts_coll <- textstat_collocations(abstracts2$text_for_coll)
+#Sys.time() - t  ### 6 минут
+
+rm(list = ls())
+load("abstracts_collocations.RData")
+```
+
+
+
+Возвращение коллокаций в текст:
+
+
+```{r}
+##########################################
+### 1. Токенизируем изначальные тексты ###
+##########################################
+
+#abstracts_lem <- abstracts2 %>% 
+#  mutate(abstract_lem = str_squish(abstract_lem)) %>% 
+#  unnest_tokens(token, abstract_lem) %>% 
+#  filter(!token %in% stopwords("ru")) %>% #
+#  mutate(token = str_replace_all(token, "ё", "е"),
+#         token_length = nchar(token)) %>% 
+  
+#  filter(token_length > 2) %>% ## 975,780
+#  select(-token_length)
+
+######################################################################
+### 2. Делаем список слов и следующих слов (без учета стоп-слов) ###
+######################################################################
+
+#abstracts_lem$potential_coll = ""
+#abstracts_lem[1:(nrow(abstracts_lem) - 1),14] = abstracts_lem[c(2:nrow(abstracts_lem)),13]
+
+
+#abstracts_lem$potential_coll = paste0(abstracts_lem$token,
+#                                      " ",
+#                                      abstracts_lem$potential_coll)
+############################
+### 3. Subset коллокаций ###
+############################
+
+#collocations_subset30 <- abstracts_coll %>%
+#  select(collocation, count) %>% 
+#  mutate(collocation2 = collocation) %>% 
+#  unnest_tokens(collocation2, collocation2) %>% 
+#  filter(!collocation2 %in% stopwords("ru")) %>% 
+#  count(collocation, count) %>% 
+#  filter(n == 2) %>% 
+#  select(-n) %>% 
+#  arrange(desc(count)) %>% 
+  
+#  mutate(collocation2 = collocation) %>% 
+#  unnest_tokens(collocation2, collocation2) %>% 
+#  mutate(word_length = nchar(collocation2)) %>% 
+#  filter(word_length > 2) %>% 
+#  count(collocation, count) %>% 
+#  filter(n == 2) %>% 
+#  select(-n) %>% 
+#  arrange(desc(count)) %>% 
+#  filter(count > 30) %>% 
+#  #select(-count) %>% 
+#  mutate(is_coll = 1) ## 1,257
+
+## 200 коллокаций при > 100,
+## 597 при > 50,
+## 1294 при > 30
+
+#write.xlsx(collocations_subset30, "collocations_subset30.xlsx")
+
+#########################################################################
+### 4. определяем части речи, удаляем глаголы и служебные части речи: ###
+#########################################################################
+
+#collocations_subset30.1 <- collocations_subset30 %>%
+#  mutate(collocation2 = collocation) %>%
+#  filter(!str_detect(collocation, "[[:digit:]]|q|w|e|r|t|y|u|i|o|p|a|s|d|f|g|h|j|k|l|z|x|c|v|b|n|m|Q|W|E|R|T|Y|U|I|O|P|A|S|D|F|G|H|J|K|L|Z|X|C|V|B|N|M")) %>% 
+#  unnest_tokens(token, collocation2)
+
+#collocations_subset30.2 <- collocations_subset30.1 %>% 
+#  count(token) %>% 
+#  mutate(token_info = NA)
+
+#t <- Sys.time()
+#for(i in c(1:nrow(collocations_subset30.2))){
+#  collocations_subset30.2[i,3] <- system2("mystem",
+#                                          c("-i ",
+#                                            "-e utf-8"),
+#                                          input = collocations_subset30.2[i,1],
+#                                          stdout = TRUE)
+#  print(str_c(i, " | ", collocations_subset30.2[i,3]))
+#}
+
+#Sys.time() - t ## 2 mins.
+
+
+#collocations_subset30.3 <- collocations_subset30.2 %>% 
+#  mutate(speech_part = token_info) %>% 
+#  separate(speech_part, c("word", "other"), "{") %>% 
+#  separate(other, c("speech_part", "other"), "\\,") %>% 
+#  separate(speech_part, c("word2", "speech_part"), "=") %>% 
+  
+#  select(-other, -word2) %>% 
+#  select(token, speech_part)
+
+
+#collocations_ready <- collocations_subset30.1 %>% 
+#  left_join(collocations_subset30.3) %>% 
+  #count(speech_part)
+#  filter(!speech_part %in% c(NA, "V", "SPRO", "PR", "NUM", "APRO", "ANUM", "ADV")) %>% 
+#  count(collocation) %>% 
+#  filter(n == 2) %>% 
+#  select(-n) %>% 
+#  mutate(is_coll = 1) %>% 
+#  filter(!collocation %in% c("социология ран", "исследование ниу", "население ниу", "институт социология"))
+
+## см. расшифровки частей речи на https://yandex.ru/dev/mystem/doc/ru/grammemes-values
+
+#rm(list = ls())
+#load("speech_parts.RData")
+
+#######################################
+### возвращение коллокаций в текст: ###
+#######################################
+
+#abstracts_lem2 <- abstracts_lem %>% 
+#  left_join(collocations_ready %>% 
+#              rename(potential_coll = collocation),
+#            by = "potential_coll") %>% 
+#  mutate(is_coll = ifelse(is.na(is_coll) == T,
+#                          0,
+#                          1)) %>% 
+#  mutate(nrow = c(1:nrow(.)))
+
+
+#collocations_size <- abstracts_lem2 %>% 
+#  filter(is_coll == 1) %>% 
+  
+#  mutate(diff = c((abstracts_lem2 %>%
+#           filter(is_coll == 1))[2:nrow(abstracts_lem2 %>%
+#                                          filter(is_coll == 1)),
+#                                 16], 97918)) %>% 
+#  mutate(diff = diff - nrow)
+
+
+#abstracts_prepared <- abstracts_lem2 %>% 
+#  filter(!nrow %in% ((collocations_size %>%
+#                        filter(diff != 1) %>%
+#                        mutate(row_to_remove = nrow + 1))$row_to_remove)) %>% 
+  
+#  mutate(final_token = ifelse(is_coll == 1,
+#                              potential_coll,
+#                              token)) %>% 
+#  select(journal_name, journal_issue, article_name, article_link, year, article_abstract, final_token)
+
+
+rm()
+
+rm(list = ls())
+load("image_after_mistake_detection.RData")
+```
+
+
+
+После всех процедур у нас **917,794 слова**, среди которых уникальных - лишь **31,894**.
+
+
+Число уникальных слов:
+
+```{r}
+abstracts_prepared %>% 
+  count(final_token) %>% 
+  nrow()
+```
+
+
+```{r}
+rm(abstracts, abstracts_coll, abstracts_lem, abstracts_lem2, collocations_ready, collocations_size, collocations_subset30, collocations_subset30.1, collocations_subset30.2, collocations_subset30.3, i, t)
+```
+
+
+
+Удаление пропущенных токенов, способных исказить картину:
+
+
+```{r}
+abstracts_prepared <- abstracts_prepared %>% 
+  #filter(str_detect(final_token, "лаппо|данилевский")) %>% 
+  
+  filter(final_token != "лаппо") %>% 
+  mutate(final_token = str_replace_all(final_token, "данилевский", "лаппо-данилевский")) %>% 
+  filter(!final_token %in% c("библиогр", "назва", "программа фундаментальный", "научный фонд", "фундаментальный исследование", "российский научный", "рамка программа", "благодарность"))
+```
+
+
+Приведение данных к dfm-формату:
+
+
+```{r}
+anti_tokens <- abstracts_prepared %>%
+  count(final_token) %>%
+  filter(n < 60) ## 24,356
+
+wf_data30 <- abstracts_prepared %>% 
+  count(journal_name, year, journal_issue, final_token) %>% 
+  
+  anti_join(anti_tokens,
+            by = "final_token") ## 573,613 (при n < 50), 669,003 при n < 10
+
+
+wf_data30 <- wf_data30 %>% 
+  filter(!final_token %in% stopwords("ru")) %>% 
+  filter(!str_detect(final_token, "[[:punct:]]|[[:digit:]]|[[:alpha:abcdefghijklmnopqrstuvwxyz]]")) ## 568,421 при n < 50, 662,061 при n < 10
+
+
+wf_data301 <- wf_data30 %>%
+  pivot_wider(names_from = "final_token",
+              values_from = "n") ## 9,485 аннотаций; 7748 переменных
+
+ids301 <- data.frame(journal_name = wf_data301$journal_name,
+                     #article_abstract = wf_data301$article_abstract, ##
+                     #article_name = wf_data301$article_name, ##
+                     #article_link = wf_data301$article_link, ##
+                     year = wf_data301$year,
+                     journal_issue = wf_data301$journal_issue, ##
+                     
+                     n_row = c(1:nrow(wf_data301)))
+
+
+wf_data301 <- wf_data301 %>% 
+  select(-journal_name,
+         -journal_issue, #
+         
+         #-article_abstract, #
+         #-article_name, #
+         #-article_link, #
+         -year)
+
+wf_data301[is.na(wf_data301)] <- 0
+
+dfm_data301 <- as.dfm(wf_data301) ## 886 аннотаций, 2508 переменные-токена
+
+# dfm_data301@docvars %>% nrow()
+# dfm_data301@p %>% length() - 1
+# str(dfm_data301)
+
+```
+
+
+
+
+## **3. Модель и результаты**
+
+
+```{r}
+t <- Sys.time()
+wf_results301.1 <- textmodel_wordfish(dfm_data301,
+                                    dir = c(2,1),
+                                    sparse = T)
+Sys.time() - t ## 12  secs
+```
+
+
+Изображение первое:
+
+
+```{r}
+wf301_docs <- tibble(n_row = wf_results301.1$docs,
+                     theta = wf_results301.1$theta,
+                     theta_se = wf_results301.1$se.theta) %>% 
+  left_join(ids301 %>% 
+              mutate(n_row = as.character(n_row)))
+
+
+plot1 <- wf301_docs %>%
+  
+  ## социология власти
+  mutate(group = 1) %>% 
+  mutate(group = ifelse(journal_name == "Социология власти" & year < 2012,
+                        "old",
+                        ifelse(journal_name == "Социология власти" &
+                                 year == 2012 &
+                                 journal_issue %in% c("номер 1",
+                                                      "номер 2",
+                                                      "номер 3"),
+                               "old",
+                               "new"))) %>% 
+  mutate(journal_name = str_replace_all(journal_name,
+                                        "Социология власти",
+                                        "Социология власти\n(до смены редакции — серым)")) %>% 
+  
+  mutate(journal_name = str_replace_all(journal_name,
+                                        "Вестник РУДН",
+                                        "Вестник РУДН. Социология")) %>% 
+  
+  ## другие журналы
+  #mutate(group = ifelse(!journal_name %in% c("Социология власти",
+  #                                           "Социологическая наука и социальная практика") 
+  #                      & year < 2017,
+  #                      "old",
+  #                      group)) %>% 
+  
+  
+  ggplot(aes(theta, reorder(journal_name, theta), fill = group)) +
+  geom_boxplot(#position = position_dodge(-1),
+    width = 0.7,
+    position = position_dodge(width=0.5)) +
+  theme_minimal() +
+  scale_fill_manual(values = c("white",
+                               "grey70")) +
+  labs(x = "присвоенный вес выпуска",
+       y = "") +
+  theme(legend.position = "none",
+        #legend.position = c(0, 2),
+        axis.text.y = element_text(color = "black",
+                                   family = "TT Times New Roman"),
+        axis.text.x = element_text(size = 8,
+                                   color = "black",
+                                   family = "TT Times New Roman"),
+        axis.title.x = element_text(size = 8,
+                                    color = "black",
+                                    face = "italic",
+                                    family = "TT Times New Roman"))
+
+plot1
+
+#png(
+#  "article_pic1.2.png",
+#  width     = 8,
+#  height    = 4,
+#  units     = "in",
+#  res       = 800,
+#  pointsize = 4
+#)
+#print(plot1)
+#dev.off() 
+```
+
+
+
+Детализация динамики СоцИса (издает по 12 выпусков в год. ко всем "ящикам с усами" при таком размере выборки, однако, следует относиться настороженно):
+
+
+```{r}
+wf301_docs %>% 
+  filter(journal_name == "Социологические исследования") %>% 
+  ggplot(aes(as.character(year), theta)) +
+  geom_boxplot() +
+  labs(title = "Динамика выпусков СоцИса в модели wordfish",
+       x = "",
+       y = 'theta (больше - либеральнее/"качественнее"') +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title.y = element_text(size = 8))
+```
+
+
+
+Изображение второе:
+
+
+
+```{r}
+wf301_terms <- tibble(feature = wf_results301.1$features,
+                      beta = wf_results301.1$beta,
+                      psi = wf_results301.1$psi,
+                      plotted_label = "")
+
+for(i in c(1:nrow(wf301_terms))){
+  
+  if(wf301_terms[i,1] %in% c(
+    
+    #Левый край:
+    "рождаемость", "пандемия", "субъективный оценка", "регрессионный анализ", "эмпирический база", "регион россия", "благополучие", "взросление", "телефонный опрос", "респондент", "доход", "профессиональный образование", "молодежь", "установка", "ценностный ориентация", "выборка", "стресс", "материальный положение", "статистически", "патриотизм", "человеческий потенциал", "молодой поколение", "доверие", "этнический", "цифровизация",
+    #Центр:
+    "статья", "исследование", "результат", "работа", "профессия", "качественный", "количественный",  "данные", "ребенок", "фактор", "труд", "мигрант", "религиозность", "бедность", "российский университет", "ценность", "связь", "опыт", "субъект", "благосостояние", "инструмент", "повседневный", "президент", "алгоритм", "социальный система", "институционализация", "социальный статус", "некоммерческий организация", "типология", "социальный структура", "поведение", "модель",
+    #Правый край:
+    "нарратив", "феминистский", "рефлексивный", "социальный порядок", "тело", "эпистемологический", "агентность", "сексуальность", "революция", "конструирование", "этика", "поле", "теория", "экспертиза", "этнографический", "дискурс", "подход", "практика", "вебер", "память", "текст", "рамка", "инвалидность", "глобализация", "биография", "концептуализация", "поворот", "властный", "преступность", "кейс", "неформальный", "коммуникация", "рынок", "идентичность", "потребление"
+    
+    )){
+    wf301_terms[i,4] = wf301_terms[i,1]
+  }
+  else {wf301_terms[i,4] = ""}
+}
+
+
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "преступность", "\nпреступность")
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "концептуализация", "\nконцептуализация")
+
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "профессия", "профессия\n")
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "повседневный", "\nповседневный")
+
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "социальный статус", "социальный статус\n")
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "институционализация", "институционализация\n")
+
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "социальный структура", "\nсоциальный структура")
+
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "религиозность", "религиозность\n")
+
+wf301_terms$plotted_label = str_replace_all(wf301_terms$plotted_label, "доверие", "\nдоверие")
+
+########################
+### график в plotly: ###
+########################
+
+#(wf301_terms %>%
+    
+   #filter(beta < 1 & beta > -1.75) %>%
+#   ggplot(aes(beta,
+#              psi,
+#              text = paste(
+#                "<b>Word: </b>", feature)
+#              )) +
+#    geom_point(size = 0.6,
+#              color = "grey40",
+#              alpha = 0.4) +
+#    theme_minimal() +
+#    geom_text(aes(label = plotted_label),
+#                    color = "black",
+#                    size = 3,
+#                    fontface = "italic"
+#            ) +
+#    theme(plot.title = element_markdown(),
+#          axis.title.y = element_markdown(),
+#          axis.title.x = element_markdown())) %>%
+#  ggplotly(tooltip = "text")
+
+
+#write.xlsx(wf301_terms, "wf_terms_for_plot2.xlsx")
+wf301_terms2 <- read.xlsx("wf_terms_for_plot2.xlsx",
+                          sheetIndex = 1)
+
+plot2 <- (wf301_terms2 %>%
+            mutate(plotted_label = str_replace_all(plotted_label,
+                                                   " ",
+                                                   "_")) %>% 
+   #filter(beta < 1.2) %>%
+   ggplot(aes(beta,
+              psi,
+              text = paste(
+                "<b>Word: </b>", feature)
+              )) +
+    geom_point(size = 0.6,
+              color = "grey80",
+              alpha = 0.4) +
+    theme_minimal() +
+   labs(x = "присвоенный  вес токена",
+         y = "фиксированный  эффект токена
+(больше = частотнее)") +
+  scale_x_continuous(limits = c(-1.70, 1.25)) +
+    geom_text(aes(label = plotted_label),
+              color = "black",
+              size = 1.8,
+              force = 1,
+              fontface = "italic",
+              family = "TT Times New Roman"
+            ) +
+    theme(axis.title.y = element_text(size = 8,
+                                      color = "black",
+                                      face = "italic",
+                                      family = "TT Times New Roman"),
+          axis.text.x = element_text(size = 8,
+                                   color = "black",
+                                   face = "italic",
+                                   family = "TT Times New Roman"),
+          axis.text.y = element_text(size = 8,
+                                   color = "black",
+                                   face = "italic",
+                                   family = "TT Times New Roman"),
+          axis.title.x = element_text(size = 8,
+                                    color = "black",
+                                    face = "italic",
+                                    family = "TT Times New Roman")))
+
+
+plot2
+
+#png(
+#  "article_pic2.2.png",
+#  width     = 8,
+#  height    = 4,
+#  units     = "in",
+#  res       = 800,
+#  pointsize = 4
+#)
+#print(plot2)
+#dev.off() 
+```
+
+
+
+Расчеты для таблицы:
+
+
+```{r}
+abstracts_prepared %>% 
+  count(journal_name, article_name, article_abstract, journal_issue) %>% 
+  count(journal_name) %>% 
+  rename(n_abstracts = n) %>% 
+  left_join(abstracts_prepared %>%
+              count(journal_name, journal_issue) %>%
+              count(journal_name) %>%
+              rename(n_issues = n)) %>% 
+  mutate(issues_abstract = str_c(n_issues, " | ", n_abstracts)) %>% 
+  arrange(desc(n_abstracts)) %>% 
+  select(journal_name, issues_abstract) %>% 
+  
+  kable()
+```
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
